@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splash Zone</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #8fd3ff; font-family: "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; top: 12px; left: 12px; right: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; pointer-events: none; }
+  #hud > * { pointer-events: auto; }
+  .pill { background: rgba(20,30,60,.82); color: #fff; border-radius: 12px; padding: 8px 14px; font-size: 18px; font-weight: 600; }
+  .pill.score { font-size: 24px; }
+  select, button { background: rgba(20,30,60,.82); color: #fff; border: 0; border-radius: 10px; padding: 8px 12px; font-size: 14px; cursor: pointer; }
+  .led { display: inline-block; padding: 2px 8px; border-radius: 6px; background: #3b4570; margin-right: 4px; transition: background .1s; }
+  .led.flash { background: #ffd400; color: #000; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #c0392b; margin-right: 6px; }
+  .dot.on { background: #2ecc71; }
+  .spacer { flex: 1; }
+  #teach { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 5; }
+  #teach.open { display: flex; }
+  #teach .box { background: #1f2540; color: #fff; border-radius: 16px; padding: 20px 24px; width: min(520px, 92vw); }
+  #teach .r { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin: 10px 0; }
+  #teach code { display: block; background: #11151d; padding: 6px 8px; border-radius: 6px; font-size: 13px; margin-top: 4px; min-height: 26px; }
+  #teach .learning code { outline: 2px solid #ffd400; }
+  #teach p { color: #a9b2d4; font-size: 14px; line-height: 1.5; margin: 6px 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="pill score">💦 <span id="hits">0</span> / <span id="throws">0</span></div>
+  <div class="pill"><span class="led" id="led1">SW1 throw</span><span class="led" id="led2">SW2 move</span></div>
+  <div class="spacer"></div>
+  <select id="zones" title="Number of zones"><option value="3">3 zones</option><option value="4">4 zones</option><option value="5">5 zones</option><option value="6">6 zones</option></select>
+  <select id="move" title="How the person moves"><option value="0">Person stays still</option><option value="1">Moves slowly</option><option value="2">Moves often</option></select>
+  <select id="voice"><option value="1">Voice on</option><option value="0">Voice off</option></select>
+  <button id="btnConnect"><span class="dot" id="connDot"></span><span id="connText">Connect CSI</span></button>
+  <button id="btnTeach">Teach switches</button>
+</div>
+<div id="teach"><div class="box">
+  <h2 style="margin:0 0 6px">Teach your switches</h2>
+  <p>Connect the CSI first. Click <b>Learn</b>, then press that switch once.</p>
+  <div class="r" id="t1"><div><b>Throw</b> (up switch)<code id="s1">—</code></div><button data-l="1">Learn</button></div>
+  <div class="r" id="t2"><div><b>Move hand</b> (right switch)<code id="s2">—</code></div><button data-l="2">Learn</button></div>
+  <p id="tmsg"></p>
+  <div style="text-align:right"><button id="btnTeachDone">Done</button></div>
+</div></div>
+
+<script>
+/* ---------- settings ---------- */
+const $ = id => document.getElementById(id);
+let S = { baud: 9600, sig: ['', '', ''], debounce: 250 };
+try { Object.assign(S, JSON.parse(localStorage.getItem('switchboard') || '{}')); } catch {}
+let G = { zones: 4, move: 1, voice: 1 };
+try { Object.assign(G, JSON.parse(localStorage.getItem('splashzone') || '{}')); } catch {}
+const saveG = () => { try { localStorage.setItem('splashzone', JSON.stringify(G)); } catch {} };
+['zones', 'move', 'voice'].forEach(k => {
+  $(k).value = G[k];
+  $(k).onchange = () => { G[k] = +$(k).value; saveG(); $(k).blur(); if (k === 'zones') setupZones(); };
+});
+
+/* ---------- canvas ---------- */
+const cv = $('c'), ctx = cv.getContext('2d');
+let W, H, DPR;
+function resize() {
+  DPR = window.devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+const zw = () => W / G.zones;
+const zx = i => (i + .5) * zw();
+const FEET = () => H * .52;          // where the person stands
+const HANDY = () => H * .86;         // where the hand is
+const SC = () => Math.min(H / 700, W / 900) * 1.15;
+
+/* ---------- state ---------- */
+let hand = 0, hits = 0, throws = 0;
+let person, balloon = null, parts = [], texts = [], puddles = [], last = performance.now();
+
+function setupZones() {
+  hand = Math.min(hand, G.zones - 1);
+  const z = Math.floor(G.zones / 2);
+  person = { zone: z, x: zx(z), state: 'idle', t: 0, nextMove: 3, face: 1 };
+  puddles = [];
+}
+setupZones();
+
+/* ---------- sound ---------- */
+let AC = null;
+function ac() { if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)(); return AC; }
+function tone(f1, f2, dur, type = 'sine', vol = .25, delay = 0) {
+  const a = ac(), o = a.createOscillator(), g = a.createGain(), t = a.currentTime + delay;
+  o.type = type; o.frequency.setValueAtTime(f1, t); o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g).connect(a.destination); o.start(t); o.stop(t + dur);
+}
+function splashSound() {
+  const a = ac(), len = a.sampleRate * .5, buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+  const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+  f.type = 'lowpass'; f.frequency.value = 1800; g.gain.value = .6;
+  s.buffer = buf; s.connect(f).connect(g).connect(a.destination); s.start();
+}
+const sfx = {
+  move: () => tone(500, 650, .08, 'triangle', .15),
+  throw: () => tone(300, 900, .25, 'sine', .2),
+  hit: () => { splashSound(); tone(900, 120, .9, 'sawtooth', .12, .15); tone(200, 600, .2, 'square', .08, 1.0); tone(600, 200, .25, 'square', .08, 1.2); },
+  miss: () => { splashSound(); },
+};
+function say(text, pitch = 1.4) {
+  if (!G.voice || !('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text); u.pitch = pitch; u.rate = 1.15; speechSynthesis.speak(u);
+}
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const HIT_LINES = ['Bleh! I am soaked!', 'Noooo! Glub glub!', 'Aaah! Cold cold cold!', 'Splooosh! You got me!', 'My hair! My beautiful hair!'];
+const MISS_LINES = ['Ha ha ha! Missed me!', 'Nyah nyah! Too slow!', 'Ha ha! Over here!', 'Hee hee hee! Try again!', 'Ha ha! Not even close!'];
+
+/* ---------- actions ---------- */
+function moveHand(d = 1) {
+  if (balloon) return;
+  hand = (hand + d + G.zones) % G.zones; sfx.move();
+}
+function throwBalloon() {
+  if (balloon || person.state === 'soaked' || person.state === 'laugh') return;
+  throws++; $('throws').textContent = throws; sfx.throw();
+  balloon = { zone: hand, x0: zx(hand), y0: HANDY() - 40 * SC(), x1: zx(hand), y1: FEET() - 120 * SC(), t: 0, dur: .75 };
+}
+function land() {
+  const b = balloon; balloon = null;
+  const hit = Math.abs(person.x - b.x1) < zw() * .42;
+  if (hit) {
+    hits++; $('hits').textContent = hits;
+    person.state = 'soaked'; person.t = 0;
+    burst(b.x1, b.y1, 70, ['#5ec8ff', '#2f8cff', '#bdeaff', '#ffffff']);
+    texts.push({ x: b.x1, y: b.y1 - 120 * SC(), s: pick(['SPLOOSH!', 'SPLASH!', 'KER-SPLAT!', 'GLUB!']), t: 0, c: '#1d6fe0' });
+    sfx.hit(); say(pick(HIT_LINES), 1.8);
+  } else {
+    const gy = FEET() + 10 * SC();
+    burst(b.x1, gy, 35, ['#5ec8ff', '#2f8cff', '#bdeaff']);
+    puddles.push({ x: b.x1, y: gy, t: 0 });
+    person.state = 'laugh'; person.t = 0; person.face = b.x1 > person.x ? 1 : -1;
+    texts.push({ x: person.x, y: FEET() - 230 * SC(), s: 'HA HA HA!', t: 0, c: '#e8452c' });
+    sfx.miss(); say(pick(MISS_LINES), 1.5);
+  }
+}
+function burst(x, y, n, colors) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = (2 + Math.random() * 7) * SC() * 60;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 200 * SC(), r: (3 + Math.random() * 7) * SC(), c: pick(colors), life: 1 });
+  }
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  const p = person;
+  p.t += dt;
+  if ((p.state === 'soaked' && p.t > 2.6) || (p.state === 'laugh' && p.t > 2.0)) { p.state = 'idle'; p.t = 0; p.nextMove = 1 + Math.random() * 2; }
+  if (p.state === 'idle' && G.move > 0) {
+    p.nextMove -= dt;
+    if (p.nextMove <= 0) {
+      let z; do { z = Math.floor(Math.random() * G.zones); } while (z === p.zone && G.zones > 1);
+      p.zone = z; p.state = 'walk'; p.t = 0;
+    }
+  }
+  if (p.state === 'walk') {
+    const tx = zx(p.zone), sp = (G.move === 2 ? 340 : 200) * SC();
+    p.face = tx > p.x ? 1 : -1;
+    if (Math.abs(tx - p.x) <= sp * dt) { p.x = tx; p.state = 'idle'; p.t = 0; p.nextMove = G.move === 2 ? 1.2 + Math.random() * 1.5 : 3 + Math.random() * 3; }
+    else p.x += p.face * sp * dt;
+  }
+  if (p.state === 'idle') p.x += (zx(p.zone) - p.x) * Math.min(1, dt * 8); // keep in zone after resize
+  if (balloon) { balloon.t += dt / balloon.dur; if (balloon.t >= 1) land(); }
+  parts.forEach(q => { q.vy += 900 * SC() * dt; q.x += q.vx * dt; q.y += q.vy * dt; q.life -= dt * .8; });
+  parts = parts.filter(q => q.life > 0);
+  texts.forEach(t => t.t += dt); texts = texts.filter(t => t.t < 1.6);
+  puddles.forEach(q => q.t += dt); puddles = puddles.filter(q => q.t < 4);
+}
+
+/* ---------- drawing ---------- */
+function draw() {
+  const s = SC();
+  // sky + grass
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#7cc8ff'); g.addColorStop(.55, '#c4ecff'); g.addColorStop(.55, '#7bd36a'); g.addColorStop(1, '#4fae45');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // sun + clouds
+  ctx.fillStyle = '#ffe36b'; ctx.beginPath(); ctx.arc(W * .9, H * .12, 40 * s, 0, 7); ctx.fill();
+  cloud(W * .18 + Math.sin(performance.now() / 4000) * 20, H * .12, s); cloud(W * .62, H * .2, s * .8);
+
+  // zones: active column highlighted
+  for (let i = 0; i < G.zones; i++) {
+    if (i === hand) { ctx.fillStyle = 'rgba(255,212,0,.22)'; ctx.fillRect(i * zw(), 0, zw(), H); }
+    if (i > 0) { ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.setLineDash([14, 12]); ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(i * zw(), 70); ctx.lineTo(i * zw(), H); ctx.stroke(); ctx.setLineDash([]); }
+    ctx.fillStyle = i === hand ? '#7a5b00' : 'rgba(255,255,255,.85)';
+    ctx.font = `bold ${26 * s}px Segoe UI`; ctx.textAlign = 'center'; ctx.fillText(i + 1, zx(i), H - 16);
+  }
+  // target ring on ground under hand's zone
+  ctx.strokeStyle = 'rgba(200,40,40,.6)'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.ellipse(zx(hand), FEET() + 6 * s, 50 * s, 14 * s, 0, 0, 7); ctx.stroke();
+
+  puddles.forEach(q => { ctx.globalAlpha = Math.max(0, 1 - q.t / 4) * .8; ctx.fillStyle = '#4aa8f0';
+    ctx.beginPath(); ctx.ellipse(q.x, q.y, 60 * s, 14 * s, 0, 0, 7); ctx.fill(); ctx.globalAlpha = 1; });
+
+  drawPerson(person, s);
+
+  // balloon in flight
+  if (balloon) {
+    const b = balloon, t = b.t;
+    const x = b.x0 + (b.x1 - b.x0) * t, y = b.y0 + (b.y1 - b.y0) * t - Math.sin(t * Math.PI) * 160 * s;
+    drawBalloon(x, y, s * (1.3 - t * .5), t * 8);
+  }
+  // hand
+  drawHand(zx(hand), HANDY(), s);
+  if (!balloon) drawBalloon(zx(hand), HANDY() - 48 * s, s * 1.3, 0);
+
+  parts.forEach(q => { ctx.globalAlpha = Math.max(0, q.life); ctx.fillStyle = q.c; ctx.beginPath(); ctx.arc(q.x, q.y, q.r, 0, 7); ctx.fill(); });
+  ctx.globalAlpha = 1;
+  texts.forEach(t => {
+    const k = Math.min(1, t.t * 5), wob = Math.sin(t.t * 20) * .08;
+    ctx.save(); ctx.translate(t.x, t.y - t.t * 30 * s); ctx.rotate(wob); ctx.scale(k, k);
+    ctx.globalAlpha = Math.min(1, (1.6 - t.t) * 2);
+    ctx.font = `900 ${64 * s}px "Comic Sans MS", "Segoe UI", sans-serif`; ctx.textAlign = 'center';
+    ctx.lineWidth = 10 * s; ctx.strokeStyle = '#fff'; ctx.strokeText(t.s, 0, 0); ctx.fillStyle = t.c; ctx.fillText(t.s, 0, 0);
+    ctx.restore();
+  });
+  ctx.globalAlpha = 1;
+}
+function cloud(x, y, s) {
+  ctx.fillStyle = 'rgba(255,255,255,.9)';
+  [[0, 0, 30], [30, -12, 36], [64, 0, 28], [32, 10, 30]].forEach(([dx, dy, r]) => { ctx.beginPath(); ctx.arc(x + dx * s, y + dy * s, r * s, 0, 7); ctx.fill(); });
+}
+function drawBalloon(x, y, s, spin) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(Math.sin(spin) * .3);
+  ctx.fillStyle = '#2f8cff'; ctx.beginPath(); ctx.ellipse(0, 0, 22 * s, 26 * s, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.beginPath(); ctx.ellipse(-8 * s, -10 * s, 6 * s, 9 * s, -.5, 0, 7); ctx.fill();
+  ctx.fillStyle = '#1f6fd6'; ctx.beginPath(); ctx.moveTo(-5 * s, 26 * s); ctx.lineTo(5 * s, 26 * s); ctx.lineTo(0, 33 * s); ctx.fill();
+  ctx.restore();
+}
+function drawHand(x, y, s) {
+  ctx.save(); ctx.translate(x, y + Math.sin(performance.now() / 300) * 3);
+  ctx.font = `${110 * s}px "Segoe UI Emoji", sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('🤚', 0, 0);
+  ctx.restore();
+}
+
+function drawPerson(p, s) {
+  const now = performance.now() / 1000;
+  let x = p.x, y = FEET(), rot = 0, jump = 0, squash = 1;
+  if (p.state === 'walk') jump = Math.abs(Math.sin(now * 10)) * 8 * s;
+  if (p.state === 'idle') jump = Math.sin(now * 3) * 2 * s;
+  if (p.state === 'laugh') { jump = Math.abs(Math.sin(p.t * 14)) * 22 * s; rot = Math.sin(p.t * 7) * .12; }
+  if (p.state === 'soaked') {
+    const t = p.t;
+    if (t < .9) { jump = Math.sin(t / .9 * Math.PI) * 90 * s; rot = t / .9 * Math.PI * 2; }   // goofy spin in the air
+    else { squash = 1 - Math.max(0, .25 - (t - .9)) * 1.2; x += Math.sin(t * 40) * Math.max(0, 1.8 - t) * 6 * s; } // shiver
+  }
+  ctx.save(); ctx.translate(x, y - jump); ctx.rotate(rot); ctx.scale(p.face * (2 - squash), squash);
+  const wet = p.state === 'soaked';
+  const skin = wet ? '#f2c7b0' : '#f7c99f', shirt = wet ? '#b84a4a' : '#ef5b5b';
+  const legSwing = p.state === 'walk' ? Math.sin(now * 12) * 12 : 0;
+  // legs
+  ctx.strokeStyle = '#2d3a6b'; ctx.lineWidth = 14 * s; ctx.lineCap = 'round';
+  line(-12, 0, -12 + legSwing, -50, s); line(12, 0, 12 - legSwing, -50, s);
+  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.ellipse((-14 + legSwing) * s, 0, 12 * s, 6 * s, 0, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse((14 - legSwing) * s, 0, 12 * s, 6 * s, 0, 0, 7); ctx.fill();
+  // body
+  ctx.fillStyle = shirt; ctx.beginPath(); ctx.roundRect(-30 * s, -125 * s, 60 * s, 80 * s, 18 * s); ctx.fill();
+  // arms
+  ctx.strokeStyle = skin; ctx.lineWidth = 12 * s;
+  if (p.state === 'laugh') { line(-28, -110, -20, -70, s); line(28, -110, 22, -70, s); }                 // holding belly
+  else if (wet) { const f = Math.sin(now * 25) * 20; line(-28, -110, -60, -160 + f, s); line(28, -110, 60, -160 - f, s); } // flailing
+  else { const a = Math.sin(now * 2) * 6; line(-28, -110, -44, -60 + a, s); line(28, -110, 44, -60 - a, s); }
+  // head
+  const hy = -160;
+  ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(0, hy * s, 38 * s, 0, 7); ctx.fill();
+  // hair (stands straight up when soaked... then droops)
+  ctx.fillStyle = '#5a3a1e';
+  if (wet) { for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.ellipse(i * 12 * s, (hy - 30) * s + Math.abs(i) * 6 * s, 6 * s, 18 * s, 0, 0, 7); ctx.fill(); } }
+  else { ctx.beginPath(); ctx.arc(0, (hy - 10) * s, 38 * s, Math.PI * 1.05, Math.PI * 1.95); ctx.fill(); }
+  // face
+  ctx.strokeStyle = '#222'; ctx.fillStyle = '#222'; ctx.lineWidth = 4 * s;
+  if (wet) {
+    [-14, 14].forEach(ex => { line(ex - 6, hy - 10, ex + 6, hy + 2, s); line(ex + 6, hy - 10, ex - 6, hy + 2, s); }); // X eyes
+    ctx.beginPath(); for (let i = 0; i <= 8; i++) ctx.lineTo((-14 + i * 3.5) * s, (hy + 18 + (i % 2 ? 4 : -2)) * s); ctx.stroke(); // wobbly mouth
+    ctx.fillStyle = '#ff7aa8'; ctx.beginPath(); ctx.ellipse(4 * s, (hy + 26) * s, 6 * s, 9 * s, 0, 0, 7); ctx.fill(); // tongue
+  } else if (p.state === 'laugh') {
+    [-14, 14].forEach(ex => { ctx.beginPath(); ctx.arc(ex * s, (hy - 4) * s, 6 * s, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke(); });
+    ctx.fillStyle = '#7a1d1d'; ctx.beginPath(); ctx.arc(0, (hy + 10) * s, 16 * s, 0, Math.PI); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillRect(-10 * s, (hy + 10) * s, 20 * s, 4 * s);
+    // laugh tears
+    ctx.fillStyle = '#7fd0ff'; [-24, 24].forEach(tx => { ctx.beginPath(); ctx.arc(tx * s, (hy + 2 + (p.t * 40 % 20)) * s, 4 * s, 0, 7); ctx.fill(); });
+  } else {
+    const blink = (now % 4) < .12;
+    [-14, 14].forEach(ex => { ctx.beginPath(); blink ? ctx.fillRect((ex - 5) * s, (hy - 6) * s, 10 * s, 2 * s) : ctx.arc(ex * s, (hy - 6) * s, 5 * s, 0, 7); ctx.fill(); });
+    ctx.beginPath(); ctx.arc(0, (hy + 8) * s, 14 * s, .2 * Math.PI, .8 * Math.PI); ctx.stroke();
+  }
+  // drips while wet
+  if (wet) {
+    ctx.fillStyle = '#5ec8ff';
+    for (let i = 0; i < 7; i++) { const dx = (i - 3) * 13, dy = ((now * 160 + i * 37) % 120); ctx.beginPath(); ctx.arc(dx * s, (hy - 20 + dy) * s, 4 * s, 0, 7); ctx.fill(); }
+    ctx.globalAlpha = .25; ctx.fillStyle = '#5ec8ff'; ctx.beginPath(); ctx.roundRect(-40 * s, (hy - 45) * s, 80 * s, 210 * s, 30 * s); ctx.fill(); ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+function line(x1, y1, x2, y2, s) { ctx.beginPath(); ctx.moveTo(x1 * s, y1 * s); ctx.lineTo(x2 * s, y2 * s); ctx.stroke(); }
+
+function loop(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  update(dt); draw(); requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ---------- input ---------- */
+const lastPress = [0, 0, 0];
+function switchPressed(n) {
+  const now = performance.now();
+  if (now - lastPress[n - 1] < (S.debounce || 0)) return;
+  lastPress[n - 1] = now;
+  const led = $('led' + Math.min(n, 2)); led.classList.add('flash'); setTimeout(() => led.classList.remove('flash'), 160);
+  try { ac().resume(); } catch {}
+  if ($('teach').classList.contains('open')) return;
+  if (n === 2) moveHand(1); else throwBalloon();
+}
+document.addEventListener('keydown', e => {
+  if (e.repeat || e.target.tagName === 'SELECT') return;
+  if (['ArrowUp', '1', ' ', 'Enter', '3'].includes(e.key)) { e.preventDefault(); switchPressed(1); }
+  else if (e.key === 'ArrowRight' || e.key === '2') { e.preventDefault(); switchPressed(2); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); moveHand(-1); }
+});
+cv.addEventListener('pointerdown', e => { try { ac().resume(); } catch {} hand = Math.min(G.zones - 1, Math.floor(e.clientX / zw())); throwBalloon(); });
+
+/* ---------- serial (signatures learned on the board) ---------- */
+let port = null, reader = null, chunkBuf = [], chunkTimer = null;
+const hex = b => [...b].map(x => x.toString(16).padStart(2, '0')).join(' ');
+function setConn(on, t) { $('connDot').classList.toggle('on', on); $('connText').textContent = t; }
+async function connect() {
+  $('btnConnect').blur();
+  if (port) { try { await reader?.cancel(); } catch {} try { await port.close(); } catch {} port = null; setConn(false, 'Connect CSI'); return; }
+  if (!('serial' in navigator)) { setConn(false, 'Use Chrome/Edge'); return; }
+  try { port = await navigator.serial.requestPort(); await port.open({ baudRate: +S.baud }); setConn(true, 'Connected'); readLoop(); }
+  catch { port = null; setConn(false, 'Connect CSI'); }
+}
+async function readLoop() {
+  while (port && port.readable) {
+    reader = port.readable.getReader();
+    try { while (true) { const { value, done } = await reader.read(); if (done) break; if (value?.length) onBytes(value); } }
+    catch {} finally { reader.releaseLock(); }
+    if (!port) break;
+  }
+  if (port) { port = null; setConn(false, 'Disconnected'); }
+}
+function onBytes(b) { chunkBuf.push(...b); clearTimeout(chunkTimer); chunkTimer = setTimeout(flush, 40); }
+let learning = 0;
+function showSigs() { $('s1').textContent = S.sig[0] || '—'; $('s2').textContent = S.sig[1] || '—'; }
+document.querySelectorAll('[data-l]').forEach(b => b.onclick = () => {
+  if (!port) { $('tmsg').textContent = 'Connect the CSI first (button at the top).'; return; }
+  learning = +b.dataset.l; $('t1').classList.toggle('learning', learning === 1); $('t2').classList.toggle('learning', learning === 2);
+  $('s' + learning).textContent = 'press the switch now…'; $('tmsg').textContent = '';
+});
+$('btnTeach').onclick = () => { showSigs(); $('teach').classList.add('open'); };
+$('btnTeachDone').onclick = () => { learning = 0; $('teach').classList.remove('open'); $('t1').classList.remove('learning'); $('t2').classList.remove('learning'); };
+function flush() {
+  let h = hex(chunkBuf); chunkBuf = [];
+  if (learning) {
+    S.sig[learning - 1] = h; try { localStorage.setItem('switchboard', JSON.stringify(S)); } catch {}
+    $('t' + learning).classList.remove('learning'); learning = 0; showSigs(); $('tmsg').textContent = 'Saved!'; return;
+  }
+  if ($('teach').classList.contains('open')) return;
+  [0, 1, 2].filter(i => S.sig[i]).sort((a, b) => S.sig[b].length - S.sig[a].length).forEach(i => {
+    if (h.includes(S.sig[i])) { switchPressed(i + 1); h = h.replace(S.sig[i], ''); }
+  });
+}
+$('btnConnect').onclick = connect;
+(async () => {
+  if (!('serial' in navigator)) return;
+  const ports = await navigator.serial.getPorts();
+  if (ports.length === 1) { port = ports[0]; try { await port.open({ baudRate: +S.baud }); setConn(true, 'Connected'); readLoop(); } catch { port = null; } }
+})();
+if (!S.sig[0] && !S.sig[1]) setTimeout(() => $('btnTeach').click(), 300);
+</script>
+</body>
+</html>
